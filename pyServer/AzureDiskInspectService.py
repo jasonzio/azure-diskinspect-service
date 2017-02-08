@@ -2,22 +2,15 @@
 
 import http.server
 import urllib
-import subprocess
-import shutil
 import sys
 import os
-import time
 import socketserver
-import logging
-import logging.handlers
-import io
 import threading
-import csv
-import glob
-from threading import Thread
 from datetime import datetime
-import GuestFishWrapper
-import KeepAliveThread
+from GuestFishWrapper import GuestFishWrapper
+from KeepAliveThread import KeepAliveThread
+
+OUTPUTDIRNAME = '/output'
 
 """
 Helper to print progress
@@ -85,27 +78,50 @@ class AzureDiskInspectService(http.server.BaseHTTPRequestHandler):
             raise ValueError('Request has insufficient number of GET parameter arguments.')
         
         operationId = urlSplit[1]
-        mode = urlSplit[2]
+        mode = str(urlSplit[2])
+        modeMajorSkipTo = 1
+        modeMinorSkipTo = 1
+        modeSplit = str(mode).split(':')
+        if len(modeSplit) > 1:
+            mode = str(modeSplit[0])
+            modeMajorSkipToStr = str(modeSplit[1])
+            modeSkipSplitStr = str(modeMajorSkipToStr).split('.')
+            if len(modeSkipSplitStr) > 1:
+                modeMajorSkipTo = int(modeSkipSplitStr[0])
+                modeMinorSkipTo = int(modeSkipSplitStr[1])
+            else:
+                modeMajorSkipTo = int(modeMajorSkipToStr)
+            
         storageAcctName = urlSplit[3]
-        container_blob_name = urlSplit[4] + '/' + urlSplit[5]
+        container_blob_name = urlSplit[4]
+        urlSplitIndex = 5
+        while (urlSplitIndex < len(urlSplit)):
+            container_blob_name = container_blob_name + '/' + urlSplit[urlSplitIndex]
+            urlSplitIndex = urlSplitIndex + 1
+
         storageUrl = urllib.parse.urlunparse(
                 ('https', storageAcctName + '.blob.core.windows.net', container_blob_name, '', urlObj.query, None))
             
-        return operationId, mode, storageAcctName, container_blob_name, storageUrl
+        return operationId, mode, modeMajorSkipTo, modeMinorSkipTo, storageAcctName, container_blob_name, storageUrl
 
     """
     Upload a local file as a HTTP binary response.
     """
-    def uploadFile(self, outputFileName):
+    def uploadFile(self, outputFileName, isPartial, osType):
         self.wfile.write(bytes('HTTP/1.1 200 OK\r\n', 'utf-8'))
         self.wfile.write(bytes('Content-Type: application/zip\r\n', 'utf-8'))
 
         statinfo = os.stat(outputFileName)
         self.wfile.write(bytes('Content-Length: {0}\r\n'.format(
             str(statinfo.st_size)), 'utf-8'))
+
+        strOutputFileName = os.path.basename(outputFileName) + "-" + osType
+        if isPartial:
+            strOutputFileName = strOutputFileName + "-partial"
+                        
         self.wfile.write(bytes(
             'Content-Disposition: Attachment; filename={0}\r\n'.format(
-                os.path.basename(outputFileName)), 'utf-8'))
+                os.path.basename(strOutputFileName)), 'utf-8'))
         self.wfile.write(bytes('\r\n', 'utf-8'))
         self.wfile.flush()
 
@@ -129,50 +145,54 @@ class AzureDiskInspectService(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         outputFileName = None
         start_time = datetime.now()
-        keepAliveWorkerThread = None
+        requestSucceeded = False
 
         try:
-            serviceMetrics.TotalRequests = serviceMetrics.TotalRequests + 1
-            rootLogger.info('<<STATS>> ' + serviceMetrics.getMetrics())
+            self.serviceMetrics.TotalRequests = self.serviceMetrics.TotalRequests + 1
+            self.rootLogger.info('<<STATS>> ' + self.serviceMetrics.getMetrics())
 
             # Parse Input Parameters
-            operationId, mode, storageAcctName, container_blob_name, storageUrl = self.ParseUrlArguments(self.path)                
-            rootLogger.info('Starting service request for <Operation Id=' + operationId + ', Mode=' + mode + ', Url=' + self.path + '>')
+            operationId, mode, modeMajorSkipTo, modeMinorSkipTo, storageAcctName, container_blob_name, storageUrl = self.ParseUrlArguments(self.path)                
+            self.rootLogger.info('Starting service request for <Operation Id=' + operationId + ', Mode=' + mode + ', Url=' + self.path + '>')
 
             # Invoke LibGuestFS Wrapper for prorcessing
-            with KeepAliveThread(self, threading.current_thread().getName()):
-                with GuestFishWrapper(self, storageUrl, OUTPUTDIRNAME, operationId, mode) as outputFileName:
+            with KeepAliveThread(self.rootLogger, self, threading.current_thread().getName()) as kpThread:
+                with GuestFishWrapper(self.rootLogger, self, storageUrl, OUTPUTDIRNAME, operationId, mode, modeMajorSkipTo, modeMinorSkipTo, kpThread) as gfWrapper:
 
                     # Upload the ZIP file
-                    if outputFileName:                
+                    if gfWrapper.outputFileName:    
+                        outputFileName = gfWrapper.outputFileName            
                         outputFileSize = round(os.path.getsize(outputFileName) / 1024, 2)
-                        rootLogger.info('Uploading: ' + outputFileName + ' (' + str(outputFileSize) + 'kb)')
-                        self.uploadFile(outputFileName)
-                        rootLogger.info('Upload completed.')
+                        self.rootLogger.info('Uploading: ' + outputFileName + ' (' + str(outputFileSize) + 'kb)')
+                        self.uploadFile(outputFileName, kpThread.wasTimeout, gfWrapper.osType)
+                        self.rootLogger.info('Upload completed.')
 
                         successElapsed = datetime.now() - start_time
-                        serviceMetrics.SuccessRequests = serviceMetrics.SuccessRequests + 1
-                        serviceMetrics.TotalSuccessServiceTime = serviceMetrics.TotalSuccessServiceTime + successElapsed.total_seconds()
+                        self.serviceMetrics.SuccessRequests = self.serviceMetrics.SuccessRequests + 1
+                        self.serviceMetrics.TotalSuccessServiceTime = self.serviceMetrics.TotalSuccessServiceTime + successElapsed.total_seconds()
+                        self.serviceMetrics.ConsecutiveErrors = 0
+                        requestSucceeded = True
 
-                        rootLogger.info('Request completed succesfully in ' + str(successElapsed.total_seconds()) + "s.")
+                        self.rootLogger.info('Request completed succesfully in ' + str(successElapsed.total_seconds()) + "s.")
                     else:
-                        rootLogger.error('Failed to create zip package.')
+                        self.rootLogger.error('Failed to create zip package.')
 
         except ValueError as ex:
-            rootLogger.error(str(ex))
-
-            self.send_response(500)
-            self.end_headers()
+            self.rootLogger.error(str(ex))
+            self.send_error(500, str(ex))
         except (IndexError, FileNotFoundError) as ex:
-            rootLogger.exception('Exception: IndexError or FileNotFound error')
-
-            self.send_response(404, 'Not Found')
-            self.end_headers()
+            self.rootLogger.exception('Exception: IndexError or FileNotFound error')
+            self.send_error(404, 'Not Found')
         except Exception as ex:
-            rootLogger.exception('Exception: ' + str(ex))
-
-            self.send_response(500)
-            self.end_headers()
+            self.rootLogger.exception('Exception: ' + str(ex))
+            self.send_error(500, str(ex))
         finally:
-            rootLogger.info('Ending service request.')
-            rootLogger.info('<<STATS>> ' + serviceMetrics.getMetrics())
+            if (not requestSucceeded):
+                self.serviceMetrics.ConsecutiveErrors = self.serviceMetrics.ConsecutiveErrors + 1
+                
+                if (self.serviceMetrics.ConsecutiveErrors > 10):
+                    self.rootLogger.error('FATAL FAILURE: More than 10 consecutive requests failed to be serviced. Shutting down.')
+                    os._exit(1)
+
+            self.rootLogger.info('Ending service request.')
+            self.rootLogger.info('<<STATS>> ' + self.serviceMetrics.getMetrics())
