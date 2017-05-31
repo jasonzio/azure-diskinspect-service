@@ -23,3 +23,4 @@ copy,/var/lib/waagent/Microsoft.*LinuxDiagnostic*/xmlCfg.xml
 echo,### Gathering OMS Agent files (used by LAD)
 copy,/etc/opt/microsoft/omsagent/LAD/conf/omsagent.d/*
 copy,/var/opt/microsoft/omsagent/LAD/log/*
+
