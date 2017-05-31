@@ -4,6 +4,7 @@ import http.server
 import urllib
 import sys
 import os
+import cgi
 import socketserver
 import threading
 from datetime import datetime
@@ -71,7 +72,7 @@ class AzureDiskInspectService(http.server.BaseHTTPRequestHandler):
     """
     Parse the URL GET parameters
     """
-    def ParseUrlArguments(self, urlPath):
+    def ParseUrlArguments(self, urlPath, sasKey):
         urlObj = urllib.parse.urlparse(urlPath)
         urlSplit = urlObj.path.split('/')
         if not len(urlSplit) >= 5:
@@ -100,16 +101,22 @@ class AzureDiskInspectService(http.server.BaseHTTPRequestHandler):
             urlSplitIndex = urlSplitIndex + 1
 
         storageUrl = urllib.parse.urlunparse(
-                ('https', storageAcctName + '.blob.core.windows.net', container_blob_name, '', urlObj.query, None))
+                ('https', storageAcctName + '.blob.core.windows.net', container_blob_name, '', sasKey, None))
             
         return operationId, mode, modeMajorSkipTo, modeMinorSkipTo, storageAcctName, container_blob_name, storageUrl
 
     """
     Upload a local file as a HTTP binary response.
     """
-    def uploadFile(self, outputFileName, isPartial, osType):
+    def uploadFile(self, http_headers, outputFileName, isPartial, osType):
+        # Set the HTTP headers, including extended content from GuestFishWrapper
         self.wfile.write(bytes('HTTP/1.1 200 OK\r\n', 'utf-8'))
         self.wfile.write(bytes('Content-Type: application/zip\r\n', 'utf-8'))
+        for header in http_headers:
+            header_value = str(http_headers[header])
+            if len( header_value ) > 0:
+                self.wfile.write(bytes( '{0}: {1}\r\n'.format( header,header_value ), 'utf-8' ))
+                self.rootLogger.info('GuestFishWrapper Header "' + header + '" = "' + header_value +'"')
 
         statinfo = os.stat(outputFileName)
         self.wfile.write(bytes('Content-Length: {0}\r\n'.format(
@@ -125,6 +132,7 @@ class AzureDiskInspectService(http.server.BaseHTTPRequestHandler):
         self.wfile.write(bytes('\r\n', 'utf-8'))
         self.wfile.flush()
 
+        # Write the zip file payload
         outputFileSize = os.path.getsize(outputFileName)
         readSize = 0
         with open(outputFileName, 'rb') as outputFileObj:
@@ -140,9 +148,19 @@ class AzureDiskInspectService(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
 
     """
-    GET request handler
+    POST request handler
     """
-    def do_GET(self):
+    def do_POST(self):
+        
+        ctype, pdict = cgi.parse_header(self.headers['content-type'])
+        if ctype == 'multipart/form-data':
+            postvars = cgi.parse_multipart(self.rfile, pdict)
+        elif ctype == 'application/x-www-form-urlencoded':
+            length = int(self.headers['content-length'])
+            postvars = cgi.parse_qs(self.rfile.read(length), keep_blank_values=1)
+        else:
+            postvars = {}
+        
         outputFileName = None
         start_time = datetime.now()
         requestSucceeded = False
@@ -152,7 +170,8 @@ class AzureDiskInspectService(http.server.BaseHTTPRequestHandler):
             self.rootLogger.info('<<STATS>> ' + self.serviceMetrics.getMetrics())
 
             # Parse Input Parameters
-            operationId, mode, modeMajorSkipTo, modeMinorSkipTo, storageAcctName, container_blob_name, storageUrl = self.ParseUrlArguments(self.path)                
+            sasKeyStr = str(postvars[b'saskey'][0], encoding='UTF-8')
+            operationId, mode, modeMajorSkipTo, modeMinorSkipTo, storageAcctName, container_blob_name, storageUrl = self.ParseUrlArguments(self.path, sasKeyStr)                
             self.rootLogger.info('Starting service request for <Operation Id=' + operationId + ', Mode=' + mode + ', Url=' + self.path + '>')
 
             # Invoke LibGuestFS Wrapper for prorcessing
@@ -164,7 +183,7 @@ class AzureDiskInspectService(http.server.BaseHTTPRequestHandler):
                         outputFileName = gfWrapper.outputFileName            
                         outputFileSize = round(os.path.getsize(outputFileName) / 1024, 2)
                         self.rootLogger.info('Uploading: ' + outputFileName + ' (' + str(outputFileSize) + 'kb)')
-                        self.uploadFile(outputFileName, kpThread.wasTimeout, gfWrapper.osType)
+                        self.uploadFile(gfWrapper.metadata_pairs, outputFileName, kpThread.wasTimeout, gfWrapper.osType)
                         self.rootLogger.info('Upload completed.')
 
                         successElapsed = datetime.now() - start_time
